@@ -9,7 +9,11 @@ import numpy as np
 from typing import List, Tuple, Dict
 import ggml
 
-from ggml import ggml_new_tensor_1d, ggml_new_tensor_2d, GGML_TYPE_F32, ggml_row_size, ggml_init_params, ggml_init
+from ggml import ggml_new_tensor_1d, ggml_new_tensor_2d, GGML_TYPE_F32, ggml_row_size, ggml_init_params, ggml_init, ggml_nbytes, ggml_get_data, \
+    ggml_new_graph, GGML_TYPE_I32, ggml_add, ggml_get_rows, ggml_norm, ggml_mul, ggml_mul_mat, ggml_repeat, ggml_view_2d, ggml_view_1d,ggml_cpy, \
+    ggml_permute, ggml_new_tensor_3d, ggml_reshape_3d, ggml_view_1d, ggml_element_size, ggml_scale_inplace, ggml_soft_max_inplace
+
+from ggml.utils import from_numpy, to_numpy
 
 def compute_ctx_size(n_embd, n_layer, n_ctx, n_mel_vocab, n_text_vocab, n_mel_position, n_text_position):
     ctx_size = 0
@@ -140,10 +144,68 @@ class GPT2Model:
 
             self.tensors["model/h" + str(i) + "/mlp/c_proj/w"]  = layer.c_mlp_proj_w
             self.tensors["model/h" + str(i) + "/mlp/c_proj/b"]  = layer.c_mlp_proj_b
+            self.gpt_layers.append(layer)
         
         self.memory_k = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, self.n_elements)
         self.memory_v = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, self.n_elements)
     
+    def generate(self, n_past, input_ids):
+
+        N = len(input_ids)
+        buf_size = 512 * 1024 * 1024  # 512MB
+        buf = np.empty(buf_size, dtype=np.uint8)
+
+        params = ggml_init_params(
+            mem_size=buf_size,
+            mem_buffer=None,
+        )
+
+        ctx0 = ggml_init(params)
+
+        embd = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, N)
+        position = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, N)
+        embd = from_numpy(np.array(input_ids, dtype=np.int32), ctx0)
+        position = from_numpy(np.arange(0, N, 1, dtype=np.int32), ctx0)
+
+        inpL = ggml_add(ctx0, ggml_get_rows(ctx0, self.text_embedding_weights, embd), ggml_get_rows(ctx0, self.text_position_embedding_weights, position))
+        
+        for i in range(self.n_layer):
+            cur = ggml_norm(ctx0, inpL, 1e-05)
+            cur = ggml_add(ctx0, ggml_mul(ctx0, ggml_repeat(ctx0, self.gpt_layers[i].ln_1_g, cur), cur), ggml_repeat(ctx0, model.gpt_layers[i].ln_1_b, cur))
+
+            cur = ggml_mul_mat(ctx0, self.gpt_layers[i].c_attn_attn_w, cur)
+            cur = ggml_add(ctx0, ggml_repeat(ctx0, self.gpt_layers[i].c_attn_attn_b, cur), cur)
+
+            Qcur = ggml_view_2d(ctx0, cur, self.n_embd, N, cur.tensor.contents.nb[1], 0 * ctypes.sizeof(ctypes.c_float) * self.n_embd)
+
+        gf = ggml_new_graph(ctx0)
+
+        ggml.ggml_build_forward_expand(gf, cur)
+        ggml.ggml_graph_compute_with_ctx(ctx0, gf, 1)
+        
+        print(to_numpy(cur))
+    
+    def main(self):
+        input_ids = [261, 259, 62, 84, 28, 2, 125, 2, 27, 5355, 2, 54, 2, 1108, 351, 0, 1024]
+        n_predict = 200
+        n_past = 0
+        embd = []
+
+        for i in range (len(embd), len(input_ids) + n_predict):
+            if len(embd) > 0:
+                self.generate(n_past, embd)
+
+            n_past += len(embd)
+            embd.clear()
+
+            if i >= len(input_ids):
+                pass
+            else:
+                for k in range(i, len(input_ids)):
+                    embd.append(input_ids[k])
+                i += len(input_ids) - 1
+
+
     @staticmethod
     def init_from_file(model_file: str, verbose=True, n_threads=1):
         with open(model_file, "rb") as fin:
@@ -159,7 +221,7 @@ class GPT2Model:
             mem_buffer = np.empty(ctx_size, dtype=np.uint8)
             init_params = ggml_init_params(
                 mem_size=ctx_size,
-                mem_buffer=mem_buffer.ctypes.data_as(ctypes.c_void_p),
+                mem_buffer=None,
             )
             ctx = ggml_init(init_params)
 
@@ -175,5 +237,27 @@ class GPT2Model:
                 n_mel_position=608
             )
 
+            # Read n_dims, length, and ttype
+
+            while True:
+                nbytes = struct.calcsize("iii")
+                data = fin.read(nbytes)
+                if len(data) != nbytes:
+                    break
+                (n_dims, s_len, ftype) = struct.unpack("iii", data)
+                dims = struct.unpack(
+                    "i" * n_dims, fin.read(struct.calcsize("i" * n_dims))
+                )
+                tensor_name = fin.read(s_len).decode("utf-8")
+                tensor = model.tensors[tensor_name]
+            
+                buf = (ctypes.c_char * ggml_nbytes(tensor)).from_address(ggml_get_data(tensor))
+                offset = fin.tell()
+                fname = fin.name.encode("utf-8")
+                fin.readinto(buf)
+
+            return model
+
 if __name__ == "__main__":
     model = GPT2Model.init_from_file("/home/anhnct/project/Compare_state_dict/XTTS_v2.0_original_model_files/ggml-model-f32.bin", n_threads=1)
+    model.generate(n_past=0, input_ids=[261, 259, 62, 84, 28, 2, 125, 2, 27, 5355, 2, 54, 2, 1108, 351, 0, 1024])
